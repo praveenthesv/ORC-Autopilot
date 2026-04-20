@@ -144,6 +144,33 @@ def extract_text_from_pdf_base64(resume_b64: str) -> str:
     return text or ""
 
 
+def extract_years_from_text(text: str) -> int:
+    # captures patterns like "over 11 years", "11 years", "12+ years"
+    matches = re.findall(r"(\d{1,2})\s*\+?\s*years", text.lower())
+    if matches:
+        return max(int(m) for m in matches)
+    return 0
+
+
+def extract_education_from_text(text: str) -> str:
+    # look for common degrees explicitly
+    patterns = [
+        r"bachelor of engineering",
+        r"b\.e\.?",
+        r"btech",
+        r"b\.tech",
+        r"m\.tech",
+        r"mba",
+        r"master of business administration",
+        r"bachelor",
+        r"master",
+    ]
+    for p in patterns:
+        if re.search(p, text.lower()):
+            return re.search(p, text.lower()).group(0).upper()
+    return ""
+
+
 def extract_resume_fields_with_groq(resume_text: str) -> dict:
     if not GROQ_API_KEY:
         return {
@@ -243,9 +270,10 @@ def evaluate_candidate():
         education_required = data.get("education_required", "")
         certifications_required = data.get("certifications_required", "")
 
-        # Resume base64
+        # Resume
         resume_b64 = data.get("resume_base64", "")
         resume_text = ""
+
         parsed_resume = {
             "parsed_skills": "",
             "parsed_education": "",
@@ -257,16 +285,31 @@ def evaluate_candidate():
 
         if resume_b64:
             resume_text = extract_text_from_pdf_base64(resume_b64)
+
+            # Rule-based extraction first
+            rule_years = extract_years_from_text(resume_text)
+            rule_edu = extract_education_from_text(resume_text)
+
             parsed_resume = extract_resume_fields_with_groq(resume_text)
 
-        # Override candidate fields with parsed resume values if available
+            # Override Groq output with rules when available
+            if rule_years > 0:
+                parsed_resume["parsed_years"] = rule_years
+            if rule_edu:
+                parsed_resume["parsed_education"] = rule_edu
+
+            # Prevent MBA hallucination
+            if parsed_resume.get("parsed_education") and "MBA" in parsed_resume["parsed_education"].upper():
+                if "MBA" not in resume_text.upper():
+                    parsed_resume["parsed_education"] = ""
+
         parsed_skills = parsed_resume.get("parsed_skills", "") or skills
         parsed_education = parsed_resume.get("parsed_education", "") or education
         parsed_certifications = parsed_resume.get("parsed_certifications", "") or certifications
         parsed_experience_text = parsed_resume.get("parsed_experience", "")
         parsed_years = float(parsed_resume.get("parsed_years", 0) or 0)
 
-        # Use resume years if provided, else use candidate experience
+        # Use resume years if provided
         final_years = parsed_years if parsed_years > 0 else experience
 
         score, gaps = calculate_score(
