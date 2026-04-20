@@ -1,8 +1,11 @@
 import os
 import json
 import re
+import base64
+import io
 import requests
 from flask import Flask, request, jsonify
+from pdfminer.high_level import extract_text
 
 app = Flask(__name__)
 
@@ -25,7 +28,7 @@ def calculate_score(candidate_exp, required_exp,
     gaps = []
 
     # Experience: 40 points
-    if required_exp and required_exp > 0:
+    if required_exp and float(required_exp) > 0:
         exp_score = min(float(candidate_exp) / float(required_exp), 1) * 40
         score += exp_score
         if float(candidate_exp) < float(required_exp):
@@ -69,7 +72,10 @@ def calculate_score(candidate_exp, required_exp,
 
 def build_ai_summary(candidate_name, role_name, score, decision, gaps):
     if not GROQ_API_KEY:
-        return f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.", gaps
+        return (
+            f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.",
+            gaps,
+        )
 
     prompt = f"""
 Return ONLY valid JSON with keys:
@@ -91,21 +97,24 @@ No markdown. No explanation.
             GROQ_URL,
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             json={
                 "model": GROQ_MODEL,
                 "messages": [
                     {"role": "system", "content": "You are a recruiter assistant. Return only JSON."},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.2
+                "temperature": 0.2,
             },
-            timeout=60
+            timeout=60,
         )
 
         if not response.ok:
-            return f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.", gaps
+            return (
+                f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.",
+                gaps,
+            )
 
         ai_text = response.json()["choices"][0]["message"]["content"].strip()
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
@@ -122,7 +131,89 @@ No markdown. No explanation.
     except Exception:
         pass
 
-    return f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.", gaps
+    return (
+        f"Candidate {candidate_name} evaluated for {role_name}. Score: {score}. Decision: {decision}.",
+        gaps,
+    )
+
+
+def extract_text_from_pdf_base64(resume_b64: str) -> str:
+    pdf_bytes = base64.b64decode(resume_b64)
+    with io.BytesIO(pdf_bytes) as pdf_stream:
+        text = extract_text(pdf_stream)
+    return text or ""
+
+
+def extract_resume_fields_with_groq(resume_text: str) -> dict:
+    if not GROQ_API_KEY:
+        return {
+            "parsed_skills": "",
+            "parsed_education": "",
+            "parsed_certifications": "",
+            "parsed_experience": "",
+            "parsed_years": 0,
+            "parsed_summary": "",
+        }
+
+    prompt = f"""
+Extract candidate details from the resume text below.
+Return ONLY valid JSON with these keys:
+- parsed_skills (comma separated)
+- parsed_education
+- parsed_certifications
+- parsed_experience
+- parsed_years (number)
+- parsed_summary
+
+Resume Text:
+{resume_text}
+"""
+
+    response = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are an AI resume parser. Return only JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        },
+        timeout=60,
+    )
+
+    if not response.ok:
+        return {
+            "parsed_skills": "",
+            "parsed_education": "",
+            "parsed_certifications": "",
+            "parsed_experience": "",
+            "parsed_years": 0,
+            "parsed_summary": "",
+        }
+
+    ai_text = response.json()["choices"][0]["message"]["content"].strip()
+    ai_text = ai_text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(ai_text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", ai_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+
+    return {
+        "parsed_skills": "",
+        "parsed_education": "",
+        "parsed_certifications": "",
+        "parsed_experience": "",
+        "parsed_years": 0,
+        "parsed_summary": "",
+    }
 
 
 @app.route("/evaluate-candidate", methods=["POST"])
@@ -135,33 +226,56 @@ def evaluate_candidate():
         # Candidate fields
         name = data.get("name", "")
         skills = data.get("skills", "")
-        experience = data.get("experience", 0)
+        experience = float(data.get("experience", 0) or 0)
         education = data.get("education", "")
         certifications = data.get("certifications", "")
-        job_requirement = data.get("job_requirement", "")
 
-        # Job requirement fields (optional if passed as structured text)
+        # Job requirement fields
         role_name = data.get("role_name", "General Role")
         must_have_skills = data.get("must_have_skills", "")
         nice_to_have_skills = data.get("nice_to_have_skills", "")
-        required_experience = data.get("required_experience", 0)
+        required_experience = float(data.get("required_experience", 0) or 0)
         education_required = data.get("education_required", "")
         certifications_required = data.get("certifications_required", "")
 
-        # Calculate deterministic score
+        # Resume base64
+        resume_b64 = data.get("resume_base64", "")
+        resume_text = ""
+        parsed_resume = {
+            "parsed_skills": "",
+            "parsed_education": "",
+            "parsed_certifications": "",
+            "parsed_experience": "",
+            "parsed_years": 0,
+            "parsed_summary": "",
+        }
+
+        if resume_b64:
+            resume_text = extract_text_from_pdf_base64(resume_b64)
+            parsed_resume = extract_resume_fields_with_groq(resume_text)
+
+        # Override candidate fields with parsed resume values if available
+        parsed_skills = parsed_resume.get("parsed_skills", "") or skills
+        parsed_education = parsed_resume.get("parsed_education", "") or education
+        parsed_certifications = parsed_resume.get("parsed_certifications", "") or certifications
+        parsed_experience_text = parsed_resume.get("parsed_experience", "")
+        parsed_years = float(parsed_resume.get("parsed_years", 0) or 0)
+
+        # Use resume years if provided, else use candidate experience
+        final_years = parsed_years if parsed_years > 0 else experience
+
         score, gaps = calculate_score(
-            candidate_exp=experience,
+            candidate_exp=final_years,
             required_exp=required_experience,
-            candidate_skills=skills,
+            candidate_skills=parsed_skills or skills,
             must_have_skills=must_have_skills,
             nice_to_have_skills=nice_to_have_skills,
-            candidate_education=education,
+            candidate_education=parsed_education,
             education_required=education_required,
-            candidate_certifications=certifications,
-            certifications_required=certifications_required
+            candidate_certifications=parsed_certifications,
+            certifications_required=certifications_required,
         )
 
-        # Decision
         if score >= 80:
             decision = "AUTO_SEND"
         elif score >= 60:
@@ -169,7 +283,6 @@ def evaluate_candidate():
         else:
             decision = "REJECT"
 
-        # Optional AI summary/gaps wording
         summary, ai_gaps = build_ai_summary(name, role_name, score, decision, gaps)
         final_gaps = ai_gaps or gaps
 
@@ -178,13 +291,18 @@ def evaluate_candidate():
             "decision": decision,
             "confidence": 0.9 if decision != "REJECT" else 0.75,
             "summary": summary,
-            "gaps": final_gaps
+            "gaps": final_gaps,
+            "parsed_skills": parsed_skills,
+            "parsed_education": parsed_education,
+            "parsed_certifications": parsed_certifications,
+            "parsed_experience": parsed_experience_text,
+            "parsed_years": final_years,
+            "parsed_summary": parsed_resume.get("parsed_summary", ""),
+            "resume_text": resume_text[:4000] if resume_text else "",
         })
 
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
