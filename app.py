@@ -165,6 +165,11 @@ Return ONLY valid JSON with these keys:
 - parsed_years (number)
 - parsed_summary
 
+Rules:
+- Use ONLY facts explicitly present in the resume text.
+- DO NOT infer or assume degrees.
+- If a field is missing, return an empty string (or 0 for parsed_years).
+
 Resume Text:
 {resume_text}
 """
