@@ -505,12 +505,12 @@ def evaluate_candidate():
             certifications_required=certifications_required,
         )
 
-        if score >= 80:
-            decision = "AUTO_SEND"
-        elif score >= 60:
-            decision = "REVIEW"
-        else:
-            decision = "REJECT"
+if score >= auto_approve_score:
+    decision = "AUTO_SEND"
+elif score >= review_score:
+    decision = "REVIEW"
+else:
+    decision = "REJECT"
 
         summary = build_ai_summary(name, role_name, score, decision, gaps)
 
